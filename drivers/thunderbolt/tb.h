@@ -32,6 +32,8 @@ struct tb_switch {
 struct tb_port {
 	struct tb_regs_port_header config;
 	struct tb_switch *sw;
+	struct tb_port *remote; /* remote port, NULL if not connected */
+	int cap_phy; /* offset, zero if not found */
 	u8 port; /* port number on switch */
 	bool invalid; /* unplugged, will go away */
 };
@@ -53,6 +55,21 @@ struct tb {
 			 * can aquire lock at least once). Used to drain wq.
 			 */
 };
+
+/**
+ * tb_upstream_port() - return the upstream port of a switch
+ *
+ * Every switch has an upstream port (for the root switch it is the NHI).
+ *
+ * During switch alloc/init tb_upstream_port()->remote may be NULL, even for
+ * non root switches (on the NHI port remote is always NULL).
+ *
+ * Return: Returns the upstream port of the switch.
+ */
+static inline struct tb_port *tb_upstream_port(struct tb_switch *sw)
+{
+	return &sw->ports[sw->config.upstream_port_number];
+}
 
 static inline u64 tb_route(struct tb_switch *sw)
 {

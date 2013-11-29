@@ -84,6 +84,25 @@ static void tb_dump_port(struct tb *tb, struct tb_regs_port_header *port)
 		port->nfc_credits);
 }
 
+
+/**
+ * tb_downstream_route() - get route to downstream switch
+ *
+ * Port must not be the upstream port (otherwise a loop is created).
+ *
+ * Return: Returns a route to the switch behind @port.
+ */
+static u64 tb_downstream_route(struct tb_port *port)
+{
+	return tb_route(port->sw)
+	       | ((u64) port->port << (port->sw->config.depth * 8));
+}
+
+static bool tb_is_upstream_port(struct tb_port *port)
+{
+	return port == tb_upstream_port(port->sw);
+}
+
 static int tb_route_length(u64 route)
 {
 	return (fls64(route) + TB_ROUTE_SHIFT - 1) / TB_ROUTE_SHIFT;
@@ -192,6 +211,84 @@ int tb_find_cap(struct tb_port *port, enum tb_cfg_space space, enum tb_cap cap)
 	return -EIO;
 }
 
+/* thunderbolt port utility functions */
+
+/**
+ * tb_port_state() - get connectedness state of a port
+ *
+ * The port must have a TB_CAP_PHY (i.e. it should be a real port).
+ *
+ * Return: Returns a tb_port_state on success or an error code on failure.
+ */
+static enum tb_port_state tb_port_state(struct tb_port *port)
+{
+	struct tb_cap_phy phy;
+	int res;
+	if (port->cap_phy == 0) {
+		tb_port_WARN(port, "does not have a PHY\n");
+		return -EINVAL;
+	}
+	res = tb_port_read(port, &phy, TB_CFG_PORT, port->cap_phy, 2);
+	if (res)
+		return res;
+	return phy.state;
+}
+
+/**
+ * tb_wait_for_port() - wait for a port to become ready
+ *
+ * Check if the port is connected but not up. If so we wait for some
+ * time to see whether it comes up.
+ *
+ * Return: Returns an error code on failure. Returns 0 if the port is not
+ * connected or failed to reach state TB_PORT_UP within one second. Returns 1
+ * if the port is connected and in state TB_PORT_UP.
+ */
+static int tb_wait_for_port(struct tb_port *port)
+{
+	int retries = 10;
+	enum tb_port_state state;
+	if (!port->cap_phy) {
+		tb_port_WARN(port, "does not have PHY\n");
+		return -EINVAL;
+	}
+	if (tb_is_upstream_port(port)) {
+		tb_port_WARN(port, "is the upstream port\n");
+		return -EINVAL;
+	}
+
+	while (retries--) {
+		state = tb_port_state(port);
+		if (state < 0)
+			return state;
+		if (state == TB_PORT_DISABLED) {
+			tb_port_info(port, "is disabled (state: 0)\n");
+			return 0;
+		}
+		if (state == TB_PORT_UNPLUGGED) {
+			tb_port_info(port, "is unplugged (state: 7)\n");
+			return 0;
+		}
+		if (state == TB_PORT_UP) {
+			tb_port_info(port,
+				     "is connected, link is up (state: 2)\n");
+			return 1;
+		}
+
+		/*
+		 * After plug-in the state is TB_PORT_CONNECTING. Give it some
+		 * time.
+		 */
+		tb_port_info(port,
+			     "is connected, link is not up (state: %d), retrying...\n",
+			     state);
+		msleep(100);
+	}
+	tb_port_WARN(port,
+		     "failed to reach state TB_PORT_UP. Ignoring port...\n");
+	return 0;
+}
+
 
 /* thunderbolt switch utility functions */
 
@@ -240,12 +337,24 @@ static int tb_plug_events_active(struct tb_switch *sw, bool active)
 static int tb_init_port(struct tb_switch *sw, u8 port_nr)
 {
 	int res;
+	int cap;
 	struct tb_port *port = &sw->ports[port_nr];
 	port->sw = sw;
 	port->port = port_nr;
+	port->remote = NULL;
 	res = tb_port_read(port, &port->config, TB_CFG_PORT, 0, 8);
 	if (res)
 		return res;
+
+	/* Port 0 is the switch itself and has no PHY. */
+	if (port->config.type == TB_TYPE_PORT && port_nr != 0) {
+		cap = tb_find_cap(port, TB_CFG_PORT, TB_CAP_PHY);
+
+		if (cap > 0)
+			port->cap_phy = cap;
+		else
+			tb_port_WARN(port, "non switch port without a PHY\n");
+	}
 
 	tb_dump_port(sw->tb, &port->config);
 
@@ -259,6 +368,14 @@ static int tb_init_port(struct tb_switch *sw, u8 port_nr)
  */
 static void tb_switch_free(struct tb_switch *sw)
 {
+	int i;
+	/* port 0 is the switch itself and never has a remote */
+	for (i = 1; i <= sw->config.max_port_number; i++) {
+		if (tb_is_upstream_port(&sw->ports[i]))
+			continue;
+		if (sw->ports[i].remote)
+			tb_switch_free(sw->ports[i].remote->sw);
+	}
 	kfree(sw->ports);
 	kfree(sw);
 }
@@ -349,6 +466,9 @@ err:
 	return NULL;
 }
 
+
+/* startup, enumeration, hot plug handling and shutdown */
+
 /**
  * reset_switch() - send TB_CFG_PKG_RESET and enable switch
  *
@@ -367,6 +487,44 @@ static int tb_switch_reset(struct tb *tb, u64 route)
 	if (res)
 		return res;
 	return tb_cfg_write(tb->cfg, ((u32 *) &header) + 2, route, 0, 2, 2, 2);
+}
+
+static void tb_link_ports(struct tb_port *down, struct tb_port *up)
+{
+	down->remote = up;
+	up->remote = down;
+}
+
+static void tb_scan_port(struct tb_port *port);
+
+static void tb_scan_ports(struct tb_switch *sw)
+{
+	int i;
+	for (i = 1; i <= sw->config.max_port_number; i++)
+		tb_scan_port(&sw->ports[i]);
+}
+
+/**
+ * tb_scan_port() - check for switches below port
+ *
+ * Checks whether port is connected. If so then we try to create a downstream
+ * switch and recursively scan its ports
+ */
+static void tb_scan_port(struct tb_port *port)
+{
+	struct tb_switch *sw;
+	if (tb_is_upstream_port(port))
+		return;
+	if (port->config.type != TB_TYPE_PORT)
+		return;
+	if (tb_wait_for_port(port) <= 0)
+		return;
+
+	sw = tb_switch_alloc(port->sw->tb, tb_downstream_route(port));
+	if (!sw)
+		return;
+	tb_link_ports(port, tb_upstream_port(sw));
+	tb_scan_ports(sw);
 }
 
 struct tb_hotplug_event {
@@ -486,6 +644,8 @@ struct tb *thunderbolt_alloc_and_start(struct tb_nhi *nhi)
 	tb->root_switch = tb_switch_alloc(tb, 0);
 	if (!tb->root_switch)
 		goto err_locked;
+
+	tb_scan_ports(tb->root_switch);
 
 	mutex_unlock(&tb->lock);
 	return tb;
