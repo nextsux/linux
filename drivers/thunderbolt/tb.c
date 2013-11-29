@@ -192,6 +192,41 @@ int tb_find_cap(struct tb_port *port, enum tb_cfg_space space, enum tb_cap cap)
 	return -EIO;
 }
 
+
+/* thunderbolt switch utility functions */
+
+/**
+ * tb_plug_events_active() - enable/disable plug events on a switch
+ *
+ * Also configures a sane plug_events_delay of 255ms.
+ *
+ * Return: Returns 0 on success or an error code on failure.
+ */
+static int tb_plug_events_active(struct tb_switch *sw, bool active)
+{
+	u32 data;
+	int res;
+
+	sw->config.plug_events_delay = 0xff;
+	res = tb_sw_write(sw, ((u32 *) &sw->config) + 4, TB_CFG_SWITCH, 4, 1);
+	if (res)
+		return res;
+
+	res = tb_sw_read(sw, &data, TB_CFG_SWITCH, sw->cap_plug_events + 1, 1);
+	if (res)
+		return res;
+
+	if (active) {
+		data = data & 0xFFFFFF83;
+		if (sw->config.device_id == 0x1547)
+			data |= 4;
+	} else {
+		data = data | 0x7c;
+	}
+	return tb_sw_write(sw, &data, TB_CFG_SWITCH,
+			   sw->cap_plug_events + 1, 1);
+}
+
 /* switch/port allocation & initialization */
 
 /**
@@ -236,6 +271,7 @@ static void tb_switch_free(struct tb_switch *sw)
 static struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
 {
 	int i;
+	int cap;
 	struct tb_switch *sw;
 	int upstream_port = tb_cfg_get_upstream_port(tb->cfg, route);
 	if (upstream_port < 0)
@@ -295,6 +331,16 @@ static struct tb_switch *tb_switch_alloc(struct tb *tb, u64 route)
 	}
 
 	/* TODO: I2C, IECS, EEPROM, link controller */
+
+	cap = tb_find_cap(&sw->ports[0], TB_CFG_SWITCH, TB_CAP_PLUG_EVENTS);
+	if (cap < 0) {
+		tb_sw_WARN(sw, "cannot find TB_CAP_PLUG_EVENTS aborting\n");
+		goto err;
+	}
+	sw->cap_plug_events = cap;
+
+	if (tb_plug_events_active(sw, true))
+		goto err;
 
 	return sw;
 err:
@@ -401,7 +447,8 @@ void thunderbolt_shutdown_and_free(struct tb *tb)
 /**
  * thunderbolt_alloc_and_start() - setup the thunderbolt bus
  *
- * Allocates a tb_cfg control channel and initializes the root switch.
+ * Allocates a tb_cfg control channel, initializes the root switch and enables
+ * plug events.
  *
  * Return: Returns NULL on error.
  */
