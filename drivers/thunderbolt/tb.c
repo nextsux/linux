@@ -11,6 +11,7 @@
 #include "dsl3510.h"
 #include "tb.h"
 #include "tb_regs.h"
+#include "tb_pci.h"
 
 /* utility functions */
 
@@ -824,6 +825,19 @@ static void tb_invalidate_below(struct tb_port *port)
 	}
 }
 
+static void destroy_invalid_tunnels(struct tb *tb)
+{
+	struct tb_pci_tunnel *tunnel;
+	struct tb_pci_tunnel *n;
+	list_for_each_entry_safe(tunnel, n, &tb->tunnel_list, list)
+	{
+		if (tb_pci_is_invalid(tunnel)) {
+			tb_pci_deactivate(tunnel);
+			tb_pci_free(tunnel);
+		}
+	}
+}
+
 struct tb_hotplug_event {
 	struct work_struct work;
 	struct tb *tb;
@@ -877,6 +891,7 @@ static void tb_handle_hotplug(struct work_struct *work)
 		if (port->remote) {
 			tb_port_info(port, "unplugged\n");
 			tb_invalidate_below(port);
+			destroy_invalid_tunnels(tb);
 			tb_switch_free(port->remote->sw);
 			port->remote = NULL;
 		} else {
@@ -918,11 +933,22 @@ static void tb_schedule_hotplug_handler(void *data, u64 route, u8 port,
  * thunderbolt_shutdown_and_free() - shutdown everything
  *
  * Free all switches and the config channel.
+ *
+ * Only tb->lock and tb->tunnel_list must be initialized. If tb->tunnel_list
+ * is populated then we assume that tb->cfg is setup.
  */
 void thunderbolt_shutdown_and_free(struct tb *tb)
 {
+	struct tb_pci_tunnel *tunnel;
+	struct tb_pci_tunnel *n;
+
 	mutex_lock(&tb->lock);
 	tb->shutdown = true; /* signal tb_handle_hotplug to quit */
+
+	list_for_each_entry_safe(tunnel, n, &tb->tunnel_list, list) {
+		tb_pci_deactivate(tunnel);
+		tb_pci_free(tunnel);
+	}
 
 	if (tb->root_switch)
 		tb_switch_free(tb->root_switch);
@@ -966,6 +992,7 @@ struct tb *thunderbolt_alloc_and_start(struct tb_nhi *nhi)
 	tb->nhi = nhi;
 	mutex_init(&tb->lock);
 	mutex_lock(&tb->lock);
+	INIT_LIST_HEAD(&tb->tunnel_list);
 
 	tb->wq = alloc_ordered_workqueue("thunderbolt", 0);
 	if (!tb->wq)

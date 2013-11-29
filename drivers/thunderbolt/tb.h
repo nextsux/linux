@@ -104,10 +104,12 @@ struct tb {
 	struct tb_cfg *cfg;
 	struct workqueue_struct *wq; /* ordered workqueue for plug events */
 	struct tb_switch *root_switch;
+	struct list_head tunnel_list; /* list of active PCIe tunnels */
 	bool shutdown;	/*
 			 * Once this is set tb_handle_hotplug will exit (once it
 			 * can aquire lock at least once). Used to drain wq.
 			 */
+
 };
 
 /**
