@@ -108,6 +108,22 @@ static int tb_route_length(u64 route)
 	return (fls64(route) + TB_ROUTE_SHIFT - 1) / TB_ROUTE_SHIFT;
 }
 
+static struct tb_switch *get_switch_at_route(struct tb_switch *sw, u64 route)
+{
+	u8 next_port = route & TB_PORT_MASK;
+	if (route == 0)
+		return sw;
+	if (next_port > sw->config.max_port_number)
+		return 0;
+	if (tb_is_upstream_port(&sw->ports[next_port]))
+		return 0;
+	if (!sw->ports[next_port].remote)
+		return 0;
+	return get_switch_at_route(sw->ports[next_port].remote->sw,
+				   route >> TB_ROUTE_SHIFT);
+}
+
+
 
 /* thunderbolt capability lookup */
 
@@ -527,6 +543,27 @@ static void tb_scan_port(struct tb_port *port)
 	tb_scan_ports(sw);
 }
 
+/**
+ * tb_invalidate_below() - recursively invalidate all ports below a given port
+ */
+static void tb_invalidate_below(struct tb_port *port)
+{
+	struct tb_switch *sw;
+	int i;
+	if (tb_is_upstream_port(port)) {
+		tb_port_WARN(port, "trying to invalidate an upstream port.\n");
+		return;
+	}
+	if (!port->remote)
+		return;
+	sw = port->remote->sw;
+	for (i = 0; i <= sw->config.max_port_number; i++) {
+		sw->ports[i].invalid = true;
+		if (!tb_is_upstream_port(&sw->ports[i]))
+			tb_invalidate_below(&sw->ports[i]);
+	}
+}
+
 struct tb_hotplug_event {
 	struct work_struct work;
 	struct tb *tb;
@@ -544,10 +581,54 @@ static void tb_handle_hotplug(struct work_struct *work)
 {
 	struct tb_hotplug_event *ev = container_of(work, typeof(*ev), work);
 	struct tb *tb = ev->tb;
+	struct tb_switch *sw;
+	struct tb_port *port;
 	mutex_lock(&tb->lock);
 	if (tb->shutdown)
 		goto out;
-	/* do nothing for now */
+
+	sw = get_switch_at_route(tb->root_switch, ev->route);
+	if (!sw) {
+		tb_WARN(tb,
+			"hotplug event for non existent switch %llx:%x (unplug: %d)\n",
+			ev->route,
+			ev->port,
+			ev->unplug)
+		goto out;
+	}
+	if (sw->config.max_port_number < ev->port) {
+		tb_WARN(tb,
+			"hotplug event for non existent port %llx:%x (unplug: %d)\n",
+			ev->route,
+			ev->port,
+			ev->unplug)
+		goto out;
+	}
+	port = &sw->ports[ev->port];
+	if (tb_is_upstream_port(port)) {
+		tb_WARN(tb,
+			"hotplug event for upstream port %llx:%x (unplug: %d)\n",
+			ev->route,
+			ev->port,
+			ev->unplug)
+		goto out;
+	}
+	if (ev->unplug) {
+		if (port->remote) {
+			tb_port_info(port, "unplugged\n");
+			tb_invalidate_below(port);
+			tb_switch_free(port->remote->sw);
+			port->remote = NULL;
+		} else {
+			tb_port_info(port,
+				     "got unplug event for disconnected port\n");
+		}
+	} else {
+		tb_port_info(port, "hotplug: scanning\n");
+		tb_scan_port(port);
+		if (!port->remote)
+			tb_port_info(port, "hotplug: no switch found\n");
+	}
 out:
 	mutex_unlock(&tb->lock);
 	kfree(ev);
