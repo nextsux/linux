@@ -144,4 +144,6 @@ static inline int tb_port_write(struct tb_port *port, void *buffer,
 struct tb *thunderbolt_alloc_and_start(struct tb_nhi *nhi);
 void thunderbolt_shutdown_and_free(struct tb *tb);
 
+int tb_find_cap(struct tb_port *port, enum tb_cfg_space space, u32 value);
+
 #endif
