@@ -12,6 +12,7 @@
 
 #include "dsl3510.h"
 #include "dsl3510_regs.h"
+#include "tb.h"
 
 #define RING_TYPE(ring) ((ring)->is_tx ? "TX ring" : "RX ring")
 
@@ -481,6 +482,7 @@ static void dsl3510_shutdown(struct tb_nhi *nhi)
 static int dsl3510_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 {
 	struct tb_nhi *nhi;
+	struct tb *tb;
 	int res;
 
 	res = pcim_enable_device(pdev);
@@ -543,14 +545,26 @@ static int dsl3510_probe(struct pci_dev *pdev, const struct pci_device_id *id)
 	/* magic value - clock related? */
 	iowrite32(3906250 / 10000, nhi->iobase + 0x38c00);
 
-	pci_set_drvdata(pdev, nhi); /* for dsl3510_remove only */
+	dev_info(&nhi->pdev->dev, "NHI initialized, starting thunderbolt\n");
+	tb = thunderbolt_alloc_and_start(nhi);
+	if (!tb) {
+		/*
+		 * At this point the RX/TX rings might already have been
+		 * activated. Do a proper shutdown.
+		 */
+		dsl3510_shutdown(nhi);
+		return -EIO;
+	}
+	pci_set_drvdata(pdev, tb); /* for dsl3510_remove only */
 
 	return 0;
 }
 
 static void dsl3510_remove(struct pci_dev *pdev)
 {
-	struct tb_nhi *nhi = pci_get_drvdata(pdev);
+	struct tb *tb = pci_get_drvdata(pdev);
+	struct tb_nhi *nhi = tb->nhi;
+	thunderbolt_shutdown_and_free(tb);
 	dsl3510_shutdown(nhi);
 }
 
